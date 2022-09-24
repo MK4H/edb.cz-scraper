@@ -8,6 +8,7 @@ authors = ["Karel Madera <karel.madera@eyen.se>"]
 python = "^3.8"
 beautifulsoup4 = "^4.11.1"
 httpx = "^0.23.0"
+lxml = "^4.9.0"
 
 [tool.poetry.dev-dependencies]
 

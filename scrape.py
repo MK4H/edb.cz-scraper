@@ -5,7 +5,7 @@ import csv
 import time
 import json
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Set
 
 import bs4
 import httpx
@@ -44,13 +44,14 @@ def scrape_contacts_v2(contacts_page: bs4.BeautifulSoup) -> List[str]:
     return company_emails
 
 
+mailto_regex = re.compile("^mailto:")
 def scrape_contacts_v3(contacts_page: bs4.BeautifulSoup) -> List[str]:
     if contacts_page.find(string="Živnost subjektu byla ukončena.") is not None:
         return []
 
     name_elem = contacts_page.find(id="h1Nadpis", attrs={"itemprop": "legalName"})
     contacts_div = name_elem.parent.parent
-    email_anchors = contacts_div.find_all(name="a", href=re.compile("^mailto:"))
+    email_anchors = contacts_div.find_all(name="a", href=mailto_regex)
     emails = [anchor["href"] for anchor in email_anchors]
     return emails
 
@@ -112,12 +113,17 @@ class Company:
             csv_out.writerow({"name": self.name, "email": email, "group": self.group.name, "url": self.contacts_url})
 
 
+contacts_regex = re.compile("/kontakt$")
+
 class Group:
     def __init__(self, name: str, url: str, session: HTTPSession, group_cache: Dict[str, int]):
         self.name = name
         self.url = url
         self.session = session
         self.num_pages: Optional[int] = group_cache.get(name, None)
+        # Validate the cache, checking if the number of pages did not change from previous run
+        if self.num_pages is not None and self.get_num_companies_on_page(self.num_pages) == 0:
+            self.num_pages = None
 
     def _get_company_divs(self, page: int) -> bs4.element.ResultSet:
         resp = self.session.delayed_get(self.url, params={"p": page})
@@ -134,16 +140,18 @@ class Group:
     def get_num_companies_on_page(self, page: int) -> int:
         return len(self._get_company_divs(page))
 
-    def get_company_urls_on_page(self, page: int) -> List[str]:
+    def get_company_urls_on_page(self, page: int, exclude_set: Set[str]) -> List[str]:
         company_divs = self._get_company_divs(page)
         company_urls = []
         for div in company_divs:
-            contact_url_elem = div.find(name="a", href=re.compile("/kontakt$"))
+            contact_url_elem = div.find(name="a", href=contacts_regex)
             if contact_url_elem is None:
                 print(f"No contact url found in {div.prettify()}", file=sys.stderr)
                 return company_urls
 
-            company_urls.append(contact_url_elem["href"])
+            company_url = contact_url_elem["href"]
+            if company_url not in exclude_set:
+                company_urls.append(company_url)
 
         return company_urls
 
@@ -174,25 +182,32 @@ class Group:
         self.num_pages = max_page_upper
         return self.num_pages
 
-    def get_random_company(self) -> Company:
+    def get_random_company(self, exclude_set: Set[str]) -> Optional[Company]:
         num_pages = self.get_num_pages()
         page = random.randint(1, num_pages)
-        company_urls = self.get_company_urls_on_page(page)
-        if len(company_urls) == 0:
-            raise Exception(f"{self.name} changed number of pages between requests, chosen page {page} does not exist")
-
-        company_url = random.choice(company_urls)
-        return Company.scrape_company(self.session, company_url, self)
+        company_urls = self.get_company_urls_on_page(page, exclude_set)
+        if len(company_urls) != 0:
+            company_url = random.choice(company_urls)
+            return Company.scrape_company(self.session, company_url, self)
+        else:
+            return None
 
 
 class Sampler:
-    def __init__(self, session: HTTPSession, groups: List[Group], num_retries: int = 10):
+    def __init__(
+            self,
+            session: HTTPSession,
+            groups: List[Group],
+            exclude_set: Set[str],
+            num_retries: int = 10
+    ):
         self.session = session
         self.groups = groups
+        self.exclude_set = exclude_set
         self.num_retries = num_retries
 
     @classmethod
-    def scrape_groups(cls, session: HTTPSession, group_cache: Path) -> "Sampler":
+    def scrape_groups(cls, session: HTTPSession, group_cache: Path, exclude_set: Set[str]) -> "Sampler":
         resp = session.delayed_get("https://www.edb.cz/katalog-firem/")
         if resp.status_code != httpx.codes.OK:
             raise Exception(f"Failed to get catalog: {resp.status_code}, {resp.text}")
@@ -206,13 +221,21 @@ class Sampler:
         except IOError:
             group_map = {}
 
-        return Sampler(session, [Group(group.string, group.a["href"], session, group_map) for group in groups])
+        return Sampler(
+            session,
+            [Group(group.string, group.a["href"], session, group_map) for group in groups],
+            exclude_set
+        )
 
     def get_sample(self) -> Optional[Company]:
         group = random.choice(self.groups)
         for retry in range(self.num_retries):
             try:
                 company = group.get_random_company()
+                # We may have hit a page with all companies excluded
+                if company is None:
+                    continue
+
                 if len(company.emails) != 0:
                     return company
                 else:
@@ -239,15 +262,31 @@ class Sampler:
             json.dump(group_cache, f)
 
 
-def run_sampling(requested_samples: int, append: bool, output_path: Path, requests_per_second: int, group_cache: Path):
+def load_exclude_set(exclude: Optional[Path]) -> Set[str]:
+    if exclude is None:
+        return set()
+    with exclude.open("r") as f:
+        reader = csv.DictReader(f)
+        return set((row["url"] for row in reader))
+
+
+def run_sampling(
+        requested_samples: int,
+        append: bool,
+        output_path: Path,
+        requests_per_second: int,
+        group_cache: Path,
+        exclude: Optional[Path]
+):
     output_exists = output_path.exists()
+    exclude_set = load_exclude_set(exclude)
     with output_path.open("a" if append else "w", newline="") as email_out:
         email_out_csv = csv.DictWriter(email_out, fieldnames=["name", "email", "group", "url"])
         if not output_exists or not append:
             email_out_csv.writeheader()
 
         with httpx.Client() as client:
-            sampler = Sampler.scrape_groups(HTTPSession(client, 1 / requests_per_second), group_cache)
+            sampler = Sampler.scrape_groups(HTTPSession(client, 1 / requests_per_second), group_cache, exclude_set)
             try:
                 collected_samples = 0
                 while collected_samples < requested_samples:
@@ -268,10 +307,11 @@ def main():
     parser.add_argument("-o", "--output", type=Path, default="contacts.csv", help="Output file path")
     parser.add_argument("-l", "--limit", type=int, default=10, help="Max number of HTTP requests per second")
     parser.add_argument("-g", "--group_cache", type=Path, default="groups.json", help="Cache file with number of pages in each group to try load and store when ending")
+    parser.add_argument("-e", "--exclude", type=Path, help="CSV file containing companies to exclude")
     parser.add_argument("num_samples", type=int, help="Number of samples to gather")
 
     args = parser.parse_args()
-    run_sampling(args.num_samples, args.append, args.output, args.limit, args.group_cache)
+    run_sampling(args.num_samples, args.append, args.output, args.limit, args.group_cache, args.exclude)
 
 
 if __name__ == "__main__":
