@@ -2,38 +2,30 @@ import random
 import re
 import sys
 import csv
-import time
 import json
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Set
 
 import bs4
 import httpx
 
 import argparse
 
+from http_session import HTTPSession
+from company import Company
+
 COMPANIES_PER_PAGE = 25
 
-
-class HTTPSession:
-    def __init__(self, client: httpx.Client, delay: float):
-        self.c = client
-        self.delay = delay
-
-    def delayed_get(self, url: str, params=None) -> httpx.Response:
-        time.sleep(self.delay)
-        return self.get(url, params)
-
-    def get(self, url: str, params=None) -> httpx.Response:
-        return self.c.get(url, params=params)
-
-
+contacts_regex = re.compile("/kontakt$")
 class Group:
     def __init__(self, name: str, url: str, session: HTTPSession, group_cache: Dict[str, int]):
         self.name = name
         self.url = url
         self.session = session
         self.num_pages: Optional[int] = group_cache.get(name, None)
+        # Validate the cache, checking if the number of pages did not change from previous run
+        if self.num_pages is not None and self.get_num_companies_on_page(self.num_pages) == 0:
+            self.num_pages = None
 
     def _get_company_divs(self, page: int) -> bs4.element.ResultSet:
         resp = self.session.delayed_get(self.url, params={"p": page})
@@ -50,16 +42,18 @@ class Group:
     def get_num_companies_on_page(self, page: int) -> int:
         return len(self._get_company_divs(page))
 
-    def get_company_urls_on_page(self, page: int) -> List[str]:
+    def get_company_urls_on_page(self, page: int, exclude_set: Set[str]) -> List[str]:
         company_divs = self._get_company_divs(page)
         company_urls = []
         for div in company_divs:
-            contact_url_elem = div.find(name="a", href=re.compile("/kontakt$"))
+            contact_url_elem = div.find(name="a", href=contacts_regex)
             if contact_url_elem is None:
                 print(f"No contact url found in {div.prettify()}", file=sys.stderr)
                 return company_urls
 
-            company_urls.append(contact_url_elem["href"])
+            company_url = contact_url_elem["href"]
+            if company_url not in exclude_set:
+                company_urls.append(company_url)
 
         return company_urls
 
@@ -89,6 +83,16 @@ class Group:
 
         self.num_pages = max_page_upper
         return self.num_pages
+
+    def get_random_company(self, exclude_set: Set[str]) -> Optional[Company]:
+        num_pages = self.get_num_pages()
+        page = random.randint(1, num_pages)
+        company_urls = self.get_company_urls_on_page(page, exclude_set)
+        if len(company_urls) != 0:
+            company_url = random.choice(company_urls)
+            return Company.scrape_company(self.session, company_url, self)
+        else:
+            return None
 
     def get_total_companies(self) -> int:
         num_last_page_companies = self.get_num_companies_on_page(self.get_num_pages())
