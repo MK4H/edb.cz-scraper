@@ -31,7 +31,7 @@ class Sampler:
         self.num_retries = num_retries
 
     @classmethod
-    def scrape_groups(cls, session: HTTPSession, group_cache: Path, exclude_set: Set[str]) -> "Sampler":
+    def scrape_groups(cls, session: HTTPSession, group_cache: Path, validate_cache: bool, exclude_set: Set[str]) -> "Sampler":
         resp = session.delayed_get("https://www.edb.cz/katalog-firem/")
         if resp.status_code != httpx.codes.OK:
             raise Exception(f"Failed to get catalog: {resp.status_code}, {resp.text}")
@@ -44,10 +44,14 @@ class Sampler:
                 group_map = json.load(f)
         except IOError:
             group_map = {}
+        groups = [Group(group.string, group.a["href"], session, group_map) for group in groups]
+        if validate_cache:
+            for group in groups:
+                group.validate_num_pages()
 
         return Sampler(
             session,
-            [Group(group.string, group.a["href"], session, group_map) for group in groups],
+            groups,
             exclude_set
         )
 
@@ -55,12 +59,13 @@ class Sampler:
         group = random.choice(self.groups)
         for retry in range(self.num_retries):
             try:
-                company = group.get_random_company()
+                company = group.get_random_company(self.exclude_set)
                 # We may have hit a page with all companies excluded
                 if company is None:
                     continue
 
                 if len(company.emails) != 0:
+                    self.exclude_set.add(company.contacts_url)
                     return company
                 else:
                     print(f"Sample failed as company {company.name} has no emails", file=sys.stderr)
@@ -73,8 +78,8 @@ class Sampler:
                 time.sleep(60)
             except Exception as e:
                 print(f"Sample failed due to {e}", file=sys.stderr)
-
-        raise Exception(f"Failed in all {self.num_retries} retries")
+        # raise Exception(f"Failed in all {self.num_retries} retries")
+        return None
 
     def store_group_cache(self, path: Path):
         group_cache = {}
@@ -86,12 +91,15 @@ class Sampler:
             json.dump(group_cache, f)
 
 
-def load_exclude_set(exclude: Optional[Path]) -> Set[str]:
+def load_exclude_set(exclude: Optional[List[Path]]) -> Set[str]:
     if exclude is None:
         return set()
-    with exclude.open("r") as f:
-        reader = csv.DictReader(f)
-        return set((row["url"] for row in reader))
+    exclude_set = set()
+    for file in exclude:
+        with file.open("r") as f:
+            reader = csv.DictReader(f)
+            exclude_set.update((row["url"] for row in reader))
+    return exclude_set
 
 
 def run_sampling(
@@ -100,7 +108,8 @@ def run_sampling(
         output_path: Path,
         requests_per_second: int,
         group_cache: Path,
-        exclude: Optional[Path]
+        validate_cache: bool,
+        exclude: Optional[List[Path]]
 ):
     output_exists = output_path.exists()
     exclude_set = load_exclude_set(exclude)
@@ -110,7 +119,7 @@ def run_sampling(
             email_out_csv.writeheader()
 
         with httpx.Client() as client:
-            sampler = Sampler.scrape_groups(HTTPSession(client, 1 / requests_per_second), group_cache, exclude_set)
+            sampler = Sampler.scrape_groups(HTTPSession(client, 1 / requests_per_second), group_cache, validate_cache, exclude_set)
             try:
                 collected_samples = 0
                 while collected_samples < requested_samples:
@@ -131,11 +140,12 @@ def main():
     parser.add_argument("-o", "--output", type=Path, default="contacts.csv", help="Output file path")
     parser.add_argument("-l", "--limit", type=int, default=10, help="Max number of HTTP requests per second")
     parser.add_argument("-g", "--group_cache", type=Path, default="groups.json", help="Cache file with number of pages in each group to try load and store when ending")
-    parser.add_argument("-e", "--exclude", type=Path, help="CSV file containing companies to exclude")
+    parser.add_argument("-v", "--validate_cache", action="store_true", help="Validate the number of pages stored in cache")
+    parser.add_argument("-e", "--exclude", nargs="*", type=Path, help="CSV file containing companies to exclude")
     parser.add_argument("num_samples", type=int, help="Number of samples to gather")
 
     args = parser.parse_args()
-    run_sampling(args.num_samples, args.append, args.output, args.limit, args.group_cache, args.exclude)
+    run_sampling(args.num_samples, args.append, args.output, args.limit, args.group_cache, args.validate_cache, args.exclude)
 
 
 if __name__ == "__main__":
