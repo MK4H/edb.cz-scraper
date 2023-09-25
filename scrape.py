@@ -68,7 +68,7 @@ class Sampler:
                     self.exclude_set.add(company.contacts_url)
                     return company
                 else:
-                    print(f"Sample failed as company {company.name} has no emails", file=sys.stderr)
+                    print(f"Sample failed as company {company.name}: '{company.contacts_url}'  has no emails", file=sys.stderr)
                     if retry + 1 == self.num_retries:
                         print(f"Sample failed as group {group.name} has too many companies without emails")
                         return None
@@ -87,8 +87,8 @@ class Sampler:
             if group.num_pages is not None:
                 group_cache[group.name] = group.num_pages
 
-        with path.open("w") as f:
-            json.dump(group_cache, f)
+        with path.open("w", encoding="utf8") as f:
+            json.dump(group_cache, f, ensure_ascii=False)
 
 
 def load_exclude_set(exclude: Optional[List[Path]]) -> Set[str]:

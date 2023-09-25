@@ -183,8 +183,8 @@ def fill_group_cache(groups: List[Group], group_cache_path: Path):
                 print("Error: Request timeout when filling cache, retrying")
                 time.sleep(60)
 
-    with group_cache_path.open("w") as f:
-        json.dump(group_cache, f)
+    with group_cache_path.open("w", encoding="utf8") as f:
+        json.dump(group_cache, f, ensure_ascii=False)
 
 
 def get_group_size(group_cache_path: Path, output_path: Path, requests_per_second: int, fill_cache: bool, validate_cache: bool):
